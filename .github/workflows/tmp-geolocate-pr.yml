@@ -1,4 +1,4 @@
-name: tmp-geolocate-pr
+name: tmp-geolocate-deep
 
 on:
   pull_request:
@@ -8,78 +8,187 @@ permissions:
   contents: read
 
 jobs:
-  collect:
+  investigate:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
-      - name: Collect Telegram archive
+      - name: Deep public-source collection
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p out/html out/media
+          mkdir -p out/telegram/html out/telegram/media out/vk/raw out/vk/chrome out/videos
           python -m pip install -q requests beautifulsoup4 lxml pillow yt-dlp
-          cat > /tmp/c.py <<'PY'
-          import requests,re,html,json,hashlib,urllib.parse,subprocess
+
+          cat > /tmp/deep.py <<'PY'
+          import requests,re,html,json,hashlib,urllib.parse,time,subprocess,os
           from pathlib import Path
           from bs4 import BeautifulSoup
-          from PIL import Image
-          O=Path('out'); S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36','Accept-Language':'ru-RU,ru;q=0.9'})
-          urls=[]
-          for mid in range(133910,133931): urls += [f'https://t.me/s/gribyspb/{mid}',f'https://t.me/gribyspb/{mid}?embed=1&mode=tme']
-          for mid in range(134486,134506): urls += [f'https://t.me/s/gribyspb/{mid}',f'https://t.me/gribyspb/{mid}?embed=1&mode=tme']
-          for before in list(range(116000,95000,-250))+[115388]: urls.append(f'https://t.me/s/gribyspb?before={before}')
-          for q in ['%23%D0%92%D0%B8%D0%BA%D1%83%D0%BB%D0%BE%D0%B2','%D0%B3%D0%BE%D1%81%D0%BD%D0%BE%D0%BC%D0%B5%D1%80','%D0%BF%D0%BE%D1%82%D0%B5%D1%80%D1%8F%D0%BB+%D0%BD%D0%BE%D0%BC%D0%B5%D1%80','%D0%BB%D1%83%D0%B6%D0%B0']:
-            for b in [135000,130000,125000,120000,116000,115500,115388,115000,112500,110000,107500,105000,102500,100000,97500,95000]: urls.append(f'https://t.me/s/gribyspb?before={b}&q={q}')
-          posts=[]; media=[]
-          for i,u in enumerate(dict.fromkeys(urls)):
-            try:
-              r=S.get(u,timeout=40); (O/'html'/f'{i:04d}.html').write_bytes(r.content); print(i,r.status_code,len(r.content),u)
-              soup=BeautifulSoup(r.text,'lxml')
-              for m in soup.select('.tgme_widget_message'):
-                post=m.get('data-post',''); txt=' '.join(m.get_text(' ',strip=True).split()); t=m.select_one('time'); dt=t.get('datetime','') if t else ''
-                posts.append({'post':post,'datetime':dt,'text':txt,'source':u})
-                for e in m.select('[style],img[src],video[src],source[src],a[href]'):
-                  vv=[]
-                  if e.get('src'): vv.append(e['src'])
-                  if e.get('href'): vv.append(e['href'])
-                  vv+=re.findall(r"url\(['\"]?([^)'\"]+)",e.get('style',''))
-                  for x in vv:
-                    x=html.unescape(x).replace('\\/','/')
-                    if x.startswith('//'): x='https:'+x
-                    if x.startswith('http') and any(k in x for k in ['telesco.pe','userapi.com','sun9-','vk.com/video','vk.ru/video']): media.append({'post':post,'url':x,'source':u})
-            except Exception as e: print('ERR',u,repr(e))
-          up={}
-          for p in posts: up[(p['post'],p['text'])]=p
-          posts=sorted(up.values(),key=lambda p:(p['datetime'],p['post']))
-          rel=[p for p in posts if any(k in p['text'].lower() for k in ['викулов','госномер','номерной знак','луж','черник','приозерск'])]
-          (O/'posts.json').write_text(json.dumps(posts,ensure_ascii=False,indent=2),'utf-8'); (O/'relevant.txt').write_text('\n\n'.join(f"{p['post']} {p['datetime']}\n{p['text']}\n{p['source']}" for p in rel),'utf-8')
-          um=[]; seen=set()
-          for m in media:
-            if m['url'] not in seen: seen.add(m['url']); um.append(m)
-          (O/'media_urls.json').write_text(json.dumps(um,ensure_ascii=False,indent=2),'utf-8')
-          man=[]
-          for i,m in enumerate(um[:600]):
-            if '/video' in m['url']: continue
-            try:
-              r=S.get(m['url'],timeout=60); ct=(r.headers.get('content-type') or '').split(';')[0]
-              if r.ok and (ct.startswith('image/') or ct.startswith('video/')) and 500<len(r.content)<100_000_000:
-                ext={'image/jpeg':'.jpg','image/png':'.png','image/webp':'.webp','video/mp4':'.mp4'}.get(ct,'.bin'); h=hashlib.sha256(r.content).hexdigest(); fp=O/'media'/f'{i:04d}_{h[:10]}{ext}'; fp.write_bytes(r.content); man.append({**m,'file':str(fp),'type':ct,'size':len(r.content),'sha':h})
-            except Exception as e: man.append({**m,'error':repr(e)})
-          (O/'manifest.json').write_text(json.dumps(man,ensure_ascii=False,indent=2),'utf-8')
-          for i,t in enumerate(['https://vk.ru/wall-1391819_922278','https://vk.com/video-1391819_456249332','https://vk.com/video-1391819_456249334','https://vk.com/video-1391819_456249335']):
-            p=subprocess.run(['yt-dlp','--no-warnings','--write-info-json','--write-thumbnail','--skip-download','-o',str(O/'media'/f'vk{i}_%(id)s.%(ext)s'),t],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=180); (O/f'ytdlp_{i}.log').write_text(p.stdout,'utf-8')
-          inv=[]
-          for p in (O/'media').glob('*'):
-            d={'file':str(p),'size':p.stat().st_size}
-            try: im=Image.open(p); d|={'w':im.width,'h':im.height,'format':im.format}
-            except: pass
-            inv.append(d)
-          (O/'inventory.json').write_text(json.dumps(inv,indent=2),'utf-8'); print('posts',len(posts),'rel',len(rel),'urls',len(um),'files',len(inv))
+
+          O=Path('out'); T=O/'telegram'; V=O/'vk'
+          S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36','Accept-Language':'ru-RU,ru;q=0.9,en;q=0.6'})
+
+          # Crawl every archive page covering Jul-Sep 2025. This catches posts not tagged #Vikulov.
+          before=115500; stop=105500; page=0; all_posts=[]; matched=[]; media=[]; seen_ranges=set()
+          while before>stop and page<700:
+              u=f'https://t.me/s/gribyspb?before={before}'
+              try:
+                  r=S.get(u,timeout=40)
+                  soup=BeautifulSoup(r.text,'lxml')
+                  msgs=soup.select('.tgme_widget_message')
+                  ids=[]
+                  for m in msgs:
+                      post=m.get('data-post','')
+                      try: pid=int(post.rsplit('/',1)[1]); ids.append(pid)
+                      except: continue
+                      txt=' '.join(m.get_text(' ',strip=True).split())
+                      tm=m.select_one('time'); dt=tm.get('datetime','') if tm else ''
+                      raw=str(m)
+                      rec={'post':post,'id':pid,'datetime':dt,'text':txt,'source':u}
+                      all_posts.append(rec)
+                      low=(txt+' '+raw).lower()
+                      author_hit=('id247610259' in low or 'викулов' in low or '927-07-66' in low or '9270766' in low)
+                      clue_hit=(('приозер' in low) and any(k in low for k in ['номер','луж','брод','лошадк','машин','черник','брусник','выруб']))
+                      if author_hit or clue_hit:
+                          matched.append(rec)
+                          for e in m.select('[style],img[src],video[src],source[src],a[href]'):
+                              vals=[]
+                              if e.get('src'): vals.append(e['src'])
+                              if e.get('href'): vals.append(e['href'])
+                              vals += re.findall(r"url\(['\"]?([^)'\"]+)",e.get('style',''))
+                              for x in vals:
+                                  x=html.unescape(x).replace('\\/','/')
+                                  if x.startswith('//'): x='https:'+x
+                                  if x.startswith('http') and any(k in x for k in ['telesco.pe','userapi.com','sun9-','vk.com/video','vk.ru/video','vkvideo.ru']):
+                                      media.append({'post':post,'url':x})
+                  if not ids: break
+                  mn=min(ids); mx=max(ids)
+                  print('TG',page,before,'->',mn,mx,'n',len(ids),'matched',len(matched))
+                  if (mn,mx) in seen_ranges or mn>=before: break
+                  seen_ranges.add((mn,mx)); before=mn; page+=1
+                  time.sleep(.08)
+              except Exception as e:
+                  print('TGERR',before,repr(e)); before-=20; page+=1
+
+          # Deduplicate and persist.
+          def dedup(xs,key):
+              d={}
+              for x in xs: d[key(x)]=x
+              return list(d.values())
+          all_posts=dedup(all_posts,lambda x:x['post'])
+          matched=dedup(matched,lambda x:x['post'])
+          matched.sort(key=lambda x:x['id'])
+          (T/'all_posts.json').write_text(json.dumps(all_posts,ensure_ascii=False,indent=2),'utf-8')
+          (T/'matched_posts.json').write_text(json.dumps(matched,ensure_ascii=False,indent=2),'utf-8')
+          (T/'matched_posts.txt').write_text('\n\n'.join(f"{p['post']} {p['datetime']}\n{p['text']}" for p in matched),'utf-8')
+
+          # Search Telegram directly with author/name/phrases, then merge results and media.
+          qs=['%23%D0%92%D0%B8%D0%BA%D1%83%D0%BB%D0%BE%D0%B2','%D0%90%D0%BB%D0%B5%D0%BA%D1%81%D0%B0%D0%BD%D0%B4%D1%80+%D0%92%D0%B8%D0%BA%D1%83%D0%BB%D0%BE%D0%B2','id247610259','927-07-66','%D0%BF%D1%80%D0%BE%D0%BF%D0%B0%D0%B2%D1%88%D0%B8%D1%85+%D0%BD%D0%BE%D0%BC%D0%B5%D1%80%D0%BE%D0%B2','%D0%BF%D0%BE%D0%B8%D1%81%D0%BA%D1%83+%D0%B1%D1%80%D0%BE%D0%B4%D0%B0']
+          for qi,q in enumerate(qs):
+              for b in [136000,130000,125000,120000,118000,116000,115500,115000,114500,114000,113500,113000,112000,110000,108000,106000]:
+                  u=f'https://t.me/s/gribyspb?before={b}&q={q}'
+                  try:
+                      r=S.get(u,timeout=35); soup=BeautifulSoup(r.text,'lxml')
+                      for m in soup.select('.tgme_widget_message'):
+                          post=m.get('data-post',''); txt=' '.join(m.get_text(' ',strip=True).split()); tm=m.select_one('time'); dt=tm.get('datetime','') if tm else ''
+                          try: pid=int(post.rsplit('/',1)[1])
+                          except: continue
+                          rec={'post':post,'id':pid,'datetime':dt,'text':txt,'source':u}
+                          matched.append(rec)
+                          for e in m.select('[style],img[src],video[src],source[src],a[href]'):
+                              vals=[]
+                              if e.get('src'): vals.append(e['src'])
+                              if e.get('href'): vals.append(e['href'])
+                              vals += re.findall(r"url\(['\"]?([^)'\"]+)",e.get('style',''))
+                              for x in vals:
+                                  x=html.unescape(x).replace('\\/','/')
+                                  if x.startswith('//'): x='https:'+x
+                                  if x.startswith('http') and any(k in x for k in ['telesco.pe','userapi.com','sun9-','vk.com/video','vk.ru/video','vkvideo.ru']): media.append({'post':post,'url':x})
+                  except Exception as e: print('SEARCHERR',u,repr(e))
+          matched=dedup(matched,lambda x:x['post']); matched.sort(key=lambda x:x['id'])
+          (T/'matched_posts_all.json').write_text(json.dumps(matched,ensure_ascii=False,indent=2),'utf-8')
+          (T/'matched_posts_all.txt').write_text('\n\n'.join(f"{p['post']} {p['datetime']}\n{p['text']}" for p in matched),'utf-8')
+
+          # Download images and extract all VK video links from candidate posts.
+          media=dedup(media,lambda x:x['url'])
+          (T/'candidate_media_urls.json').write_text(json.dumps(media,ensure_ascii=False,indent=2),'utf-8')
+          manifest=[]; video_urls=[]
+          for i,m in enumerate(media):
+              u=m['url']
+              if any(k in u for k in ['vk.com/video','vk.ru/video','vkvideo.ru']): video_urls.append(u); continue
+              try:
+                  r=S.get(u,timeout=60,allow_redirects=True); ct=(r.headers.get('content-type') or '').split(';')[0].lower()
+                  if r.ok and ct.startswith('image/') and 500<len(r.content)<30_000_000:
+                      ext={'image/jpeg':'.jpg','image/png':'.png','image/webp':'.webp'}.get(ct,'.bin'); h=hashlib.sha256(r.content).hexdigest(); fp=T/'media'/f'{i:04d}_{h[:12]}{ext}'
+                      if not fp.exists(): fp.write_bytes(r.content)
+                      manifest.append({**m,'file':str(fp),'type':ct,'size':len(r.content),'sha':h})
+              except Exception as e: manifest.append({**m,'error':repr(e)})
+          (T/'media_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),'utf-8')
+
+          # Known videos plus every video linked from candidate posts: metadata+thumbnail. Download known 2025 clips fully.
+          known=['https://vk.com/video-1391819_456249332','https://vk.com/video-1391819_456249334','https://vk.com/video-1391819_456249335']
+          targets=dedup([{'url':u} for u in known+video_urls],lambda x:x['url'])
+          for i,x in enumerate(targets[:80]):
+              u=x['url']; base=str(O/'videos'/f'{i:03d}_%(id)s.%(ext)s')
+              try:
+                  p=subprocess.run(['yt-dlp','--no-warnings','--write-info-json','--write-thumbnail','--skip-download','-o',base,u],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=180)
+                  (O/'videos'/f'{i:03d}.log').write_text(p.stdout,'utf-8')
+              except Exception as e: (O/'videos'/f'{i:03d}.log').write_text(repr(e),'utf-8')
+          for i,u in enumerate(known):
+              try:
+                  p=subprocess.run(['yt-dlp','--no-warnings','-f','best[height<=1080]/best','-o',str(O/'videos'/f'known{i}_%(id)s.%(ext)s'),u],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=360)
+                  (O/'videos'/f'known{i}_download.log').write_text(p.stdout,'utf-8')
+              except Exception as e: (O/'videos'/f'known{i}_download.log').write_text(repr(e),'utf-8')
+
+          # Raw VK pages, APIs and search variants.
+          vk_urls={
+            'target_ru':'https://vk.ru/wall-1391819_922278',
+            'target_com':'https://vk.com/wall-1391819_922278',
+            'target_m_ru':'https://m.vk.ru/wall-1391819_922278',
+            'target_m_com':'https://m.vk.com/wall-1391819_922278',
+            'target_al':'https://vk.com/wall-1391819_922278?act=show&al=1',
+            'search1':'https://vk.com/wall-1391819?search=%D0%A1%D0%BA%D0%B2%D0%BE%D0%B7%D1%8C%20%D0%BB%D1%83%D0%B6%D0%B8%20%D0%B7%D0%B0%20%D1%81%D0%B8%D0%BD%D0%B5%D0%B9%20%D0%BC%D0%B5%D1%87%D1%82%D0%BE%D0%B9',
+            'search2':'https://vk.com/grib_spb?search=%D0%A1%D0%BA%D0%B2%D0%BE%D0%B7%D1%8C%20%D0%BB%D1%83%D0%B6%D0%B8%20%D0%B7%D0%B0%20%D1%81%D0%B8%D0%BD%D0%B5%D0%B9%20%D0%BC%D0%B5%D1%87%D1%82%D0%BE%D0%B9',
+            'search3':'https://vk.com/search?c%5Bq%5D=%D0%A1%D0%BA%D0%B2%D0%BE%D0%B7%D1%8C%20%D0%BB%D1%83%D0%B6%D0%B8%20%D0%B7%D0%B0%20%D1%81%D0%B8%D0%BD%D0%B5%D0%B9%20%D0%BC%D0%B5%D1%87%D1%82%D0%BE%D0%B9&c%5Bsection%5D=statuses',
+            'author':'https://vk.com/id247610259',
+            'author_ru':'https://vk.ru/id247610259',
+            'oembed':'https://vk.com/oembed?url=https%3A%2F%2Fvk.com%2Fwall-1391819_922278',
+            'api_post':'https://api.vk.com/method/wall.getById?posts=-1391819_922278&extended=1&v=5.199',
+            'api_comments':'https://api.vk.com/method/wall.getComments?owner_id=-1391819&post_id=922278&count=100&thread_items_count=10&extended=1&v=5.199'
+          }
+          for name,u in vk_urls.items():
+              for tag,ua in [('desktop',S.headers['User-Agent']),('googlebot','Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'),('mobile','Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 Chrome/126 Mobile Safari/537.36')]:
+                  try:
+                      r=requests.get(u,headers={'User-Agent':ua,'Accept-Language':'ru-RU,ru;q=0.9'},timeout=70,allow_redirects=True)
+                      (V/'raw'/f'{name}_{tag}.headers.txt').write_text('\n'.join(f'{k}: {v}' for k,v in r.headers.items())+f'\nSTATUS {r.status_code}\nFINAL {r.url}\n','utf-8')
+                      (V/'raw'/f'{name}_{tag}.body').write_bytes(r.content)
+                      print('VK',name,tag,r.status_code,len(r.content),r.url)
+                  except Exception as e: (V/'raw'/f'{name}_{tag}.err').write_text(repr(e),'utf-8')
           PY
-          python /tmp/c.py | tee out/run.log
+          python /tmp/deep.py | tee out/deep.log
+
+          # Render key VK pages in system Chrome. The DOM often contains comments/attachment IDs even behind the login prompt.
+          CHROME="$(command -v google-chrome || command -v chromium || command -v chromium-browser || true)"
+          echo "$CHROME" > out/vk/chrome/path.txt
+          if [ -n "$CHROME" ]; then
+            declare -A PAGES
+            PAGES[target]='https://vk.ru/wall-1391819_922278'
+            PAGES[target_com]='https://vk.com/wall-1391819_922278'
+            PAGES[target_mobile]='https://m.vk.com/wall-1391819_922278'
+            PAGES[search]='https://vk.com/wall-1391819?search=%D0%A1%D0%BA%D0%B2%D0%BE%D0%B7%D1%8C%20%D0%BB%D1%83%D0%B6%D0%B8%20%D0%B7%D0%B0%20%D1%81%D0%B8%D0%BD%D0%B5%D0%B9%20%D0%BC%D0%B5%D1%87%D1%82%D0%BE%D0%B9'
+            PAGES[author]='https://vk.com/id247610259'
+            for name in "${!PAGES[@]}"; do
+              url="${PAGES[$name]}"
+              timeout 150 "$CHROME" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --hide-scrollbars --window-size=1440,5000 --virtual-time-budget=35000 --screenshot="out/vk/chrome/${name}.png" "$url" >"out/vk/chrome/${name}.screenshot.log" 2>&1 || true
+              timeout 150 "$CHROME" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --virtual-time-budget=35000 --dump-dom "$url" >"out/vk/chrome/${name}.html" 2>"out/vk/chrome/${name}.dom.log" || true
+            done
+          fi
+
           find out -type f -printf '%s %p\n' | sort -nr > out/files.txt
+          du -ah out | sort -h | tail -100 > out/du.txt
+
       - uses: actions/upload-artifact@v4
         with:
-          name: geolocate-data
+          name: geolocate-deep
           path: out
           retention-days: 1
+          if-no-files-found: error
