@@ -1,0 +1,85 @@
+name: tmp-geolocate-pr
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Collect Telegram archive
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/html out/media
+          python -m pip install -q requests beautifulsoup4 lxml pillow yt-dlp
+          cat > /tmp/c.py <<'PY'
+          import requests,re,html,json,hashlib,urllib.parse,subprocess
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          O=Path('out'); S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36','Accept-Language':'ru-RU,ru;q=0.9'})
+          urls=[]
+          for mid in range(133910,133931): urls += [f'https://t.me/s/gribyspb/{mid}',f'https://t.me/gribyspb/{mid}?embed=1&mode=tme']
+          for mid in range(134486,134506): urls += [f'https://t.me/s/gribyspb/{mid}',f'https://t.me/gribyspb/{mid}?embed=1&mode=tme']
+          for before in list(range(116000,95000,-250))+[115388]: urls.append(f'https://t.me/s/gribyspb?before={before}')
+          for q in ['%23%D0%92%D0%B8%D0%BA%D1%83%D0%BB%D0%BE%D0%B2','%D0%B3%D0%BE%D1%81%D0%BD%D0%BE%D0%BC%D0%B5%D1%80','%D0%BF%D0%BE%D1%82%D0%B5%D1%80%D1%8F%D0%BB+%D0%BD%D0%BE%D0%BC%D0%B5%D1%80','%D0%BB%D1%83%D0%B6%D0%B0']:
+            for b in [135000,130000,125000,120000,116000,115500,115388,115000,112500,110000,107500,105000,102500,100000,97500,95000]: urls.append(f'https://t.me/s/gribyspb?before={b}&q={q}')
+          posts=[]; media=[]
+          for i,u in enumerate(dict.fromkeys(urls)):
+            try:
+              r=S.get(u,timeout=40); (O/'html'/f'{i:04d}.html').write_bytes(r.content); print(i,r.status_code,len(r.content),u)
+              soup=BeautifulSoup(r.text,'lxml')
+              for m in soup.select('.tgme_widget_message'):
+                post=m.get('data-post',''); txt=' '.join(m.get_text(' ',strip=True).split()); t=m.select_one('time'); dt=t.get('datetime','') if t else ''
+                posts.append({'post':post,'datetime':dt,'text':txt,'source':u})
+                for e in m.select('[style],img[src],video[src],source[src],a[href]'):
+                  vv=[]
+                  if e.get('src'): vv.append(e['src'])
+                  if e.get('href'): vv.append(e['href'])
+                  vv+=re.findall(r"url\(['\"]?([^)'\"]+)",e.get('style',''))
+                  for x in vv:
+                    x=html.unescape(x).replace('\\/','/')
+                    if x.startswith('//'): x='https:'+x
+                    if x.startswith('http') and any(k in x for k in ['telesco.pe','userapi.com','sun9-','vk.com/video','vk.ru/video']): media.append({'post':post,'url':x,'source':u})
+            except Exception as e: print('ERR',u,repr(e))
+          up={}
+          for p in posts: up[(p['post'],p['text'])]=p
+          posts=sorted(up.values(),key=lambda p:(p['datetime'],p['post']))
+          rel=[p for p in posts if any(k in p['text'].lower() for k in ['викулов','госномер','номерной знак','луж','черник','приозерск'])]
+          (O/'posts.json').write_text(json.dumps(posts,ensure_ascii=False,indent=2),'utf-8'); (O/'relevant.txt').write_text('\n\n'.join(f"{p['post']} {p['datetime']}\n{p['text']}\n{p['source']}" for p in rel),'utf-8')
+          um=[]; seen=set()
+          for m in media:
+            if m['url'] not in seen: seen.add(m['url']); um.append(m)
+          (O/'media_urls.json').write_text(json.dumps(um,ensure_ascii=False,indent=2),'utf-8')
+          man=[]
+          for i,m in enumerate(um[:600]):
+            if '/video' in m['url']: continue
+            try:
+              r=S.get(m['url'],timeout=60); ct=(r.headers.get('content-type') or '').split(';')[0]
+              if r.ok and (ct.startswith('image/') or ct.startswith('video/')) and 500<len(r.content)<100_000_000:
+                ext={'image/jpeg':'.jpg','image/png':'.png','image/webp':'.webp','video/mp4':'.mp4'}.get(ct,'.bin'); h=hashlib.sha256(r.content).hexdigest(); fp=O/'media'/f'{i:04d}_{h[:10]}{ext}'; fp.write_bytes(r.content); man.append({**m,'file':str(fp),'type':ct,'size':len(r.content),'sha':h})
+            except Exception as e: man.append({**m,'error':repr(e)})
+          (O/'manifest.json').write_text(json.dumps(man,ensure_ascii=False,indent=2),'utf-8')
+          for i,t in enumerate(['https://vk.ru/wall-1391819_922278','https://vk.com/video-1391819_456249332','https://vk.com/video-1391819_456249334','https://vk.com/video-1391819_456249335']):
+            p=subprocess.run(['yt-dlp','--no-warnings','--write-info-json','--write-thumbnail','--skip-download','-o',str(O/'media'/f'vk{i}_%(id)s.%(ext)s'),t],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=180); (O/f'ytdlp_{i}.log').write_text(p.stdout,'utf-8')
+          inv=[]
+          for p in (O/'media').glob('*'):
+            d={'file':str(p),'size':p.stat().st_size}
+            try: im=Image.open(p); d|={'w':im.width,'h':im.height,'format':im.format}
+            except: pass
+            inv.append(d)
+          (O/'inventory.json').write_text(json.dumps(inv,indent=2),'utf-8'); print('posts',len(posts),'rel',len(rel),'urls',len(um),'files',len(inv))
+          PY
+          python /tmp/c.py | tee out/run.log
+          find out -type f -printf '%s %p\n' | sort -nr > out/files.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geolocate-data
+          path: out
+          retention-days: 1
