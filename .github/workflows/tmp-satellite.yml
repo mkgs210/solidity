@@ -1,0 +1,239 @@
+name: tmp-satellite-candidates
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  candidates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Build Priозersky field candidates and satellite contact sheets
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/sheets out/thumbs out/data out/mosaics
+          python -m pip install -q requests shapely pyproj pillow numpy pandas scipy scikit-image
+          cat > /tmp/candidates.py <<'PY'
+          import requests, json, math, time, os, io, hashlib
+          from pathlib import Path
+          import numpy as np, pandas as pd
+          from PIL import Image, ImageDraw, ImageFont
+          from shapely.geometry import Polygon, MultiPolygon, shape, Point, LineString, mapping
+          from shapely.ops import transform, unary_union, polygonize
+          from pyproj import Transformer
+
+          O=Path('out'); S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0 geolocation-research/1.0'})
+          # District boundary from OpenStreetMap/Nominatim.
+          burls=[
+            'https://nominatim.openstreetmap.org/lookup?osm_ids=R1117608&format=geojson&polygon_geojson=1',
+            'https://nominatim.openstreetmap.org/lookup?osm_ids=R1117608&format=json&polygon_geojson=1']
+          boundary=None
+          for u in burls:
+            try:
+              r=S.get(u,timeout=90); print('BOUNDARY',r.status_code,len(r.content),r.url)
+              (O/'data'/'boundary_raw').write_bytes(r.content)
+              if r.ok:
+                j=r.json()
+                if isinstance(j,dict) and j.get('features'): boundary=shape(j['features'][0]['geometry'])
+                elif isinstance(j,list) and j and j[0].get('geojson'): boundary=shape(j[0]['geojson'])
+                if boundary: break
+            except Exception as e: print('BERR',repr(e))
+          if boundary is None:
+            # conservative fallback bbox; later filters still work
+            boundary=Polygon([(29.05,60.32),(31.02,60.32),(31.02,61.38),(29.05,61.38)])
+          (O/'data'/'boundary.geojson').write_text(json.dumps({'type':'Feature','geometry':mapping(boundary),'properties':{}},ensure_ascii=False),'utf-8')
+          minx,miny,maxx,maxy=boundary.bounds; print('BBOX',boundary.bounds)
+
+          # Overpass: all mapped open-land polygons, tracks/roads, settlements in the official district relation.
+          q='''[out:json][timeout:300];
+          rel(1117608); map_to_area->.a;
+          (
+            way["landuse"~"^(meadow|farmland|grass|orchard|farmyard|recreation_ground)$"](area.a);
+            relation["landuse"~"^(meadow|farmland|grass|orchard|farmyard|recreation_ground)$"](area.a);
+            way["natural"~"^(grassland|heath|scrub)$"](area.a);
+            relation["natural"~"^(grassland|heath|scrub)$"](area.a);
+            way["landcover"~"^(grass|meadow)$"](area.a);
+            node["place"~"^(city|town|village|hamlet|isolated_dwelling)$"](area.a);
+            way["highway"~"^(track|unclassified|service|path)$"](area.a);
+          ); out body geom;'''
+          over=None
+          for endpoint in ['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.nchc.org.tw/api/interpreter']:
+            try:
+              r=S.post(endpoint,data={'data':q},timeout=420); print('OVERPASS',endpoint,r.status_code,len(r.content))
+              if r.ok and len(r.content)>1000: over=r.json(); break
+            except Exception as e: print('OERR',endpoint,repr(e))
+          if over is None: raise RuntimeError('Overpass failed')
+          (O/'data'/'overpass.json').write_text(json.dumps(over,ensure_ascii=False),'utf-8')
+
+          to_utm=Transformer.from_crs('EPSG:4326','EPSG:32636',always_xy=True).transform
+          to_ll=Transformer.from_crs('EPSG:32636','EPSG:4326',always_xy=True).transform
+          b_utm=transform(to_utm,boundary)
+          fields=[]; settlements=[]; roads=[]
+          for e in over.get('elements',[]):
+            typ=e.get('type'); tags=e.get('tags',{}); geom=e.get('geometry')
+            if typ=='node' and tags.get('place'):
+              settlements.append({'id':e['id'],'name':tags.get('name',''),'place':tags.get('place'),'geom':Point(e['lon'],e['lat'])})
+              continue
+            if not geom or len(geom)<2: continue
+            coords=[(p['lon'],p['lat']) for p in geom]
+            if tags.get('highway'):
+              try: roads.append({'id':e['id'],'highway':tags.get('highway'),'geom':LineString(coords)})
+              except: pass
+              continue
+            if tags.get('landuse') or tags.get('natural') or tags.get('landcover'):
+              try:
+                if coords[0]!=coords[-1]: coords.append(coords[0])
+                g=Polygon(coords)
+                if not g.is_valid: g=g.buffer(0)
+                if not g.is_empty: fields.append({'osm_type':typ,'osm_id':e['id'],'tags':tags,'geom':g})
+              except Exception as ex: pass
+          print('RAW fields',len(fields),'roads',len(roads),'settlements',len(settlements))
+
+          # Keep/merge practical meadow-field patches. Geometry in metric UTM.
+          geoms=[]; meta=[]
+          for f in fields:
+            g=transform(to_utm,f['geom']).intersection(b_utm)
+            if g.is_empty: continue
+            for part in (list(g.geoms) if isinstance(g,MultiPolygon) else [g]):
+              if part.area>=7000:
+                geoms.append(part); meta.append(f)
+          # Merge touching/nearby pieces that visually form one open field complex.
+          merged=unary_union([g.buffer(8) for g in geoms]).buffer(-8)
+          parts=list(merged.geoms) if isinstance(merged,MultiPolygon) else [merged]
+          settlements_u=[(s,transform(to_utm,s['geom'])) for s in settlements]
+          roads_u=[(r,transform(to_utm,r['geom'])) for r in roads]
+
+          def major_axis(g):
+            rect=g.minimum_rotated_rectangle
+            cs=list(rect.exterior.coords)[:4]
+            seg=[]
+            for i in range(4):
+              dx=cs[(i+1)%4][0]-cs[i][0]; dy=cs[(i+1)%4][1]-cs[i][1]
+              seg.append((math.hypot(dx,dy),dx,dy))
+            L,dx,dy=max(seg)
+            # compass bearing 0=N, 90=E; undirected 0..180
+            b=(math.degrees(math.atan2(dx,dy))+360)%360
+            if b>=180: b-=180
+            return b,L,min(x[0] for x in seg)
+          rows=[]
+          for i,g in enumerate(parts):
+            if g.is_empty: continue
+            area=g.area/10000
+            if not (0.7<=area<=120): continue
+            c=g.centroid; lon,lat=transform(to_ll,c).coords[0]
+            if not boundary.buffer(0.001).contains(Point(lon,lat)): continue
+            b,L,W=major_axis(g)
+            # axis error to NW-SE (desired undirected axis around 140 deg / 320 deg)
+            axis_err=min(abs(b-140),180-abs(b-140))
+            ds=min([c.distance(sg) for _,sg in settlements_u],default=99999)
+            dn=''; dp=''
+            if settlements_u:
+              ss,sg=min(settlements_u,key=lambda x:c.distance(x[1])); dn=ss['name']; dp=ss['place']
+            dr=min([g.distance(rg) for _,rg in roads_u],default=99999)
+            # count tracks within 100m and tracks crossing/entering field edge
+            nr=sum(1 for _,rg in roads_u if g.buffer(100).intersects(rg))
+            perim=g.length; compact=4*math.pi*g.area/(perim*perim) if perim else 0
+            # Score is broad on purpose; manual review follows.
+            area_pref=math.exp(-((math.log(max(area,1e-3))-math.log(12))/1.3)**2/2)
+            axis_pref=math.exp(-(axis_err/30)**2/2)
+            remote=min(ds/3000,1.5)
+            road_pref=1 if dr<80 else math.exp(-(dr-80)/300)
+            score=2.2*area_pref+1.0*axis_pref+0.8*remote+0.7*road_pref+0.15*min(nr,4)-0.5*max(compact-0.75,0)
+            rows.append({'id':i,'lon':lon,'lat':lat,'area_ha':area,'axis_bearing':b,'axis_error':axis_err,'length_m':L,'width_m':W,'aspect':L/max(W,1),'compactness':compact,'settlement_dist_m':ds,'nearest_settlement':dn,'nearest_place_type':dp,'road_dist_m':dr,'nearby_tracks':nr,'score':score,'geom':g})
+          rows.sort(key=lambda r:r['score'],reverse=True)
+          print('CANDIDATES',len(rows))
+          df=pd.DataFrame([{k:v for k,v in r.items() if k!='geom'} for r in rows]); df.to_csv(O/'data'/'candidates.csv',index=False)
+          feats=[{'type':'Feature','geometry':mapping(transform(to_ll,r['geom'])),'properties':{k:v for k,v in r.items() if k!='geom'}} for r in rows]
+          (O/'data'/'candidates.geojson').write_text(json.dumps({'type':'FeatureCollection','features':feats},ensure_ascii=False),'utf-8')
+          (O/'data'/'settlements.geojson').write_text(json.dumps({'type':'FeatureCollection','features':[{'type':'Feature','geometry':mapping(s['geom']),'properties':{k:v for k,v in s.items() if k!='geom'}} for s in settlements]},ensure_ascii=False),'utf-8')
+
+          # Slippy tile helpers / ESRI satellite imagery.
+          TILE='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+          def ll2px(lon,lat,z):
+            n=2**z; x=(lon+180)/360*n*256
+            latr=math.radians(max(min(lat,85.05112878),-85.05112878)); y=(1-math.asinh(math.tan(latr))/math.pi)/2*n*256
+            return x,y
+          def px2ll(x,y,z):
+            n=2**z; lon=x/(n*256)*360-180; yy=math.pi*(1-2*y/(n*256)); lat=math.degrees(math.atan(math.sinh(yy))); return lon,lat
+          cache={}
+          def tile(x,y,z):
+            key=(x,y,z)
+            if key in cache:return cache[key]
+            for tries in range(3):
+              try:
+                rr=S.get(TILE.format(z=z,y=y,x=x),timeout=45)
+                if rr.ok and len(rr.content)>1000:
+                  im=Image.open(io.BytesIO(rr.content)).convert('RGB'); cache[key]=im; return im
+              except: pass
+              time.sleep(1)
+            return Image.new('RGB',(256,256),(210,210,210))
+          def crop_center(lon,lat,z,size=1024):
+            cx,cy=ll2px(lon,lat,z); left=int(round(cx-size/2)); top=int(round(cy-size/2)); right=left+size; bottom=top+size
+            tx0=left//256; ty0=top//256; tx1=(right-1)//256; ty1=(bottom-1)//256
+            mos=Image.new('RGB',((tx1-tx0+1)*256,(ty1-ty0+1)*256))
+            for ty in range(ty0,ty1+1):
+              for tx in range(tx0,tx1+1): mos.paste(tile(tx,ty,z),((tx-tx0)*256,(ty-ty0)*256))
+            return mos.crop((left-tx0*256,top-ty0*256,right-tx0*256,bottom-ty0*256)),left,top
+
+          # Top mapped candidates: zoom 15, ~1.2 km square at this latitude.
+          top=rows[:180]
+          thumbs=[]
+          for rank,r in enumerate(top,1):
+            im,left,toppx=crop_center(r['lon'],r['lat'],15,1024)
+            d=ImageDraw.Draw(im,'RGBA')
+            # field outline
+            llg=transform(to_ll,r['geom'])
+            polys=list(llg.geoms) if isinstance(llg,MultiPolygon) else [llg]
+            for p in polys:
+              pts=[]
+              for lon,lat in p.exterior.coords:
+                x,y=ll2px(lon,lat,15); pts.append((x-left,y-toppx))
+              d.line(pts,fill=(255,0,0,240),width=6,joint='curve')
+            # NW sun arrow from center, compass 320 degrees.
+            cx,cy=ll2px(r['lon'],r['lat'],15); cx-=left; cy-=toppx
+            ang=math.radians(320); ex=cx+120*math.sin(ang); ey=cy-120*math.cos(ang)
+            d.line((cx,cy,ex,ey),fill=(255,255,0,240),width=7); d.ellipse((cx-10,cy-10,cx+10,cy+10),fill=(255,255,0,240))
+            im=im.resize((430,430),Image.Resampling.LANCZOS)
+            canvas=Image.new('RGB',(450,500),'white'); canvas.paste(im,(10,10)); dd=ImageDraw.Draw(canvas)
+            label=f"#{rank} id={r['id']}  {r['lat']:.5f},{r['lon']:.5f}\n{r['area_ha']:.1f}ha  axis {r['axis_bearing']:.0f}°  asp {r['aspect']:.1f}\nsett {r['settlement_dist_m']/1000:.1f}km {r['nearest_settlement']}  road {r['road_dist_m']:.0f}m"
+            dd.multiline_text((10,445),label,fill='black',spacing=2)
+            fp=O/'thumbs'/f'{rank:03d}_{r["id"]}_{r["lat"]:.5f}_{r["lon"]:.5f}.jpg'; canvas.save(fp,quality=90); thumbs.append(canvas)
+            if rank%20==0: print('THUMB',rank)
+          for si in range((len(thumbs)+19)//20):
+            chunk=thumbs[si*20:(si+1)*20]; sheet=Image.new('RGB',(450*4,500*5),'white')
+            for j,t in enumerate(chunk): sheet.paste(t,((j%4)*450,(j//4)*500))
+            sheet.save(O/'sheets'/f'candidates_{si+1:02d}.jpg',quality=92)
+
+          # Broad z12 district satellite mosaic for detecting unmapped open patches manually.
+          z=12; x0,y1=ll2px(minx,miny,z); x1,y0=ll2px(maxx,maxy,z)
+          left=int(min(x0,x1)); right=int(max(x0,x1)); top=int(min(y0,y1)); bottom=int(max(y0,y1))
+          tx0=left//256; tx1=right//256; ty0=top//256; ty1=bottom//256
+          W=(tx1-tx0+1)*256; H=(ty1-ty0+1)*256; print('MOSAIC',W,H,'tiles',(tx1-tx0+1)*(ty1-ty0+1))
+          mos=Image.new('RGB',(W,H))
+          for ty in range(ty0,ty1+1):
+            for tx in range(tx0,tx1+1): mos.paste(tile(tx,ty,z),((tx-tx0)*256,(ty-ty0)*256))
+          # Overlay official boundary and mapped candidate centers.
+          draw=ImageDraw.Draw(mos,'RGBA')
+          def localxy(lon,lat):
+            x,y=ll2px(lon,lat,z); return x-tx0*256,y-ty0*256
+          bparts=list(boundary.geoms) if isinstance(boundary,MultiPolygon) else [boundary]
+          for bp in bparts: draw.line([localxy(*c) for c in bp.exterior.coords],fill=(255,0,0,255),width=5)
+          for rank,r in enumerate(rows[:180],1):
+            x,y=localxy(r['lon'],r['lat']); rad=5; draw.ellipse((x-rad,y-rad,x+rad,y+rad),fill=(255,255,0,230)); draw.text((x+5,y-5),str(rank),fill=(255,255,0,255))
+          mos.save(O/'mosaics'/'district_z12_candidates.jpg',quality=92)
+          # clean copy too
+          print('DONE')
+          PY
+          python /tmp/candidates.py | tee out/run.log
+          find out -type f -printf '%s %p\n' | sort -nr > out/files.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: satellite-candidates
+          path: out
+          retention-days: 1
+          if-no-files-found: error
