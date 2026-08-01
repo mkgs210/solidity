@@ -1,0 +1,137 @@
+name: tmp-geolocate-exact
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  exact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Fetch exact public VK posts, photos, reverse-search pages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/raw out/chrome out/images out/reverse
+          python -m pip install -q requests beautifulsoup4 lxml pillow exifread
+          cat > /tmp/fetch.py <<'PY'
+          import requests, json, re, html, os, urllib.parse, hashlib
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          O=Path('out'); S=requests.Session()
+          uas={
+            'desktop':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+            'googlebot':'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+            'mobile':'Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 Chrome/126 Mobile Safari/537.36'}
+          posts=['247610259_4510','247610259_4489','247610259_4467','247610259_4520']
+          photos=list(range(457343694,457343704))+list(range(457343633,457343649))+list(range(457343584,457343595))+list(range(457343753,457343770))
+          urls={}
+          for p in posts:
+            urls[f'wall_{p}_m']=f'https://m.vk.ru/wall{p}'
+            urls[f'wall_{p}_ru']=f'https://vk.ru/wall{p}'
+            urls[f'wall_{p}_com']=f'https://vk.com/wall{p}'
+            urls[f'oembed_{p}']='https://vk.com/oembed?url='+urllib.parse.quote(f'https://vk.com/wall{p}',safe='')
+          for pid in photos:
+            urls[f'photo_{pid}_m']=f'https://m.vk.ru/photo247610259_{pid}'
+            urls[f'photo_{pid}_ru']=f'https://vk.ru/photo247610259_{pid}'
+          urls['instagram']='https://www.instagram.com/vikulovsasha/'
+          urls['vk_alias']='https://vk.com/vikulovsasha'
+          urls['vk_photos']='https://vk.com/albums247610259'
+          urls['vk_wall_search']='https://vk.com/wall247610259?search=%D0%BF%D0%BE%D1%82%D0%B5%D1%80%D1%8F%D0%BB%20%D0%BD%D0%BE%D0%BC%D0%B5%D1%80'
+          rec=[]
+          for name,u in urls.items():
+            for tag,ua in uas.items():
+              try:
+                r=requests.get(u,headers={'User-Agent':ua,'Accept-Language':'ru-RU,ru;q=0.9,en;q=0.6'},timeout=60,allow_redirects=True)
+                fp=O/'raw'/f'{name}_{tag}.body'; fp.write_bytes(r.content)
+                (O/'raw'/f'{name}_{tag}.headers').write_text(f'STATUS {r.status_code}\nFINAL {r.url}\n'+ '\n'.join(f'{k}: {v}' for k,v in r.headers.items()),'utf-8')
+                rec.append({'name':name,'ua':tag,'url':u,'status':r.status_code,'final':r.url,'size':len(r.content),'type':r.headers.get('content-type')})
+                print(name,tag,r.status_code,len(r.content),r.url)
+              except Exception as e:
+                rec.append({'name':name,'ua':tag,'url':u,'error':repr(e)})
+          (O/'requests.json').write_text(json.dumps(rec,ensure_ascii=False,indent=2),'utf-8')
+
+          # Parse structured data, API prefetch caches, photo URLs, comments, and geo-like fields.
+          report=[]; media=[]
+          for fp in (O/'raw').glob('*.body'):
+            try: txt=fp.read_text('utf-8',errors='ignore')
+            except: continue
+            soup=BeautifulSoup(txt,'lxml')
+            visible=' '.join(soup.get_text(' ',strip=True).split())
+            lds=[]
+            for sc in soup.find_all('script',{'type':'application/ld+json'}):
+              try: lds.append(json.loads(sc.string or sc.get_text()))
+              except: pass
+            ids=sorted(set(re.findall(r'(?:photo|wall)(?:-?1391819|247610259)_[0-9]+',txt)))
+            urls2=[]
+            raw=html.unescape(txt).replace('\\/','/')
+            for u in re.findall(r'https?://[^\s"\'<>]+',raw):
+              u=u.rstrip('),;]')
+              if any(k in u for k in ['userapi.com','vkuserphoto.ru','sun9-','vk.com/video','vk.ru/video']): urls2.append(u)
+            urls2=list(dict.fromkeys(urls2)); media += [{'source':fp.name,'url':u} for u in urls2]
+            keys={}
+            for pat in ['"geo"','"coordinates"','"latitude"','"longitude"','"lat"','"long"','place_id','map_point','location','address']:
+              if pat.lower() in txt.lower():
+                snippets=[]
+                for m in list(re.finditer(re.escape(pat),txt,re.I))[:15]: snippets.append(txt[max(0,m.start()-300):m.start()+700])
+                keys[pat]=snippets
+            report.append({'file':fp.name,'length':len(txt),'title':soup.title.get_text(' ',strip=True) if soup.title else None,'visible':visible[:12000],'ids':ids,'ld_json':lds,'geo_snippets':keys})
+          (O/'parsed_report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),'utf-8')
+          media=list({x['url']:x for x in media}.values()); (O/'media_urls.json').write_text(json.dumps(media,ensure_ascii=False,indent=2),'utf-8')
+
+          # Download every full-size image URL exposed by exact post/photo pages and inspect metadata.
+          mani=[]; seen=set()
+          for i,m in enumerate(media):
+            try:
+              r=requests.get(m['url'],headers={'User-Agent':uas['desktop'],'Referer':'https://vk.com/'},timeout=60,allow_redirects=True)
+              ct=(r.headers.get('content-type') or '').split(';')[0]
+              if r.ok and ct.startswith('image/') and 1000<len(r.content)<40_000_000:
+                h=hashlib.sha256(r.content).hexdigest()
+                if h in seen: continue
+                seen.add(h); ext={'image/jpeg':'.jpg','image/png':'.png','image/webp':'.webp'}.get(ct,'.bin')
+                p=O/'images'/f'{len(seen):04d}_{h[:12]}{ext}'; p.write_bytes(r.content)
+                mani.append({**m,'final':r.url,'type':ct,'size':len(r.content),'file':str(p),'sha256':h})
+            except Exception as e: pass
+          (O/'image_manifest.json').write_text(json.dumps(mani,ensure_ascii=False,indent=2),'utf-8')
+
+          # Reverse image search using exact field image and VK personal-photo candidate URLs.
+          field='https://sun9-78.vkuserphoto.ru/s/v1/ig2/cTFSrR6uPIPxWhKvRwY82nG3rwj6SlNrYKWYJXWlhLPHvoRABl01hunoYwXcUF4X_qdTVpibzpWPaP1JE9YYuh1U.jpg?quality=95&as=32x24,48x36,72x54,108x81,160x120,240x180,360x270,480x360,540x405,640x480,720x540,1080x810,1280x960,1440x1080,2560x1920&from=bu&cs=1280x0'
+          reverse={
+            'google_lens':'https://lens.google.com/uploadbyurl?url='+urllib.parse.quote(field,safe=''),
+            'google_search':'https://www.google.com/searchbyimage?image_url='+urllib.parse.quote(field,safe=''),
+            'yandex':'https://yandex.com/images/search?rpt=imageview&url='+urllib.parse.quote(field,safe=''),
+            'bing':'https://www.bing.com/images/searchbyimage/upload?cbir=sbi&imgurl='+urllib.parse.quote(field,safe='')}
+          for name,u in reverse.items():
+            try:
+              r=requests.get(u,headers={'User-Agent':uas['desktop'],'Accept-Language':'ru-RU,ru;q=0.9,en;q=0.6'},timeout=90,allow_redirects=True)
+              (O/'reverse'/f'{name}.html').write_bytes(r.content)
+              (O/'reverse'/f'{name}.headers').write_text(f'STATUS {r.status_code}\nFINAL {r.url}\n'+ '\n'.join(f'{k}: {v}' for k,v in r.headers.items()),'utf-8')
+              print('REV',name,r.status_code,len(r.content),r.url)
+            except Exception as e: (O/'reverse'/f'{name}.err').write_text(repr(e),'utf-8')
+          PY
+          python /tmp/fetch.py | tee out/run.log
+
+          CHROME="$(command -v google-chrome || command -v chromium || command -v chromium-browser || true)"
+          if [ -n "$CHROME" ]; then
+            for spec in \
+              'wall4510|https://vk.com/wall247610259_4510' \
+              'wall4489|https://vk.com/wall247610259_4489' \
+              'photo703|https://vk.com/photo247610259_457343703' \
+              'photo694|https://vk.com/photo247610259_457343694' \
+              'instagram|https://www.instagram.com/vikulovsasha/'; do
+              name="${spec%%|*}"; url="${spec#*|}"
+              timeout 150 "$CHROME" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --hide-scrollbars --window-size=1440,5000 --virtual-time-budget=30000 --screenshot="out/chrome/${name}.png" "$url" >"out/chrome/${name}.screenshot.log" 2>&1 || true
+              timeout 150 "$CHROME" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --virtual-time-budget=30000 --dump-dom "$url" >"out/chrome/${name}.html" 2>"out/chrome/${name}.dom.log" || true
+            done
+          fi
+          find out -type f -printf '%s %p\n' | sort -nr > out/files.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geolocate-exact
+          path: out
+          retention-days: 1
+          if-no-files-found: error

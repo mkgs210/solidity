@@ -1,0 +1,154 @@
+name: tmp-geolocate
+
+on:
+  push:
+    branches: [tmp-vk-geolocate-20260801]
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Collect public post history and media
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/html out/media out/logs
+          python -m pip install -q requests beautifulsoup4 lxml pillow yt-dlp
+          cat > /tmp/collect.py <<'PY'
+          import os, re, json, html, hashlib, urllib.parse, subprocess, time
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          OUT=Path('out'); (OUT/'html').mkdir(parents=True,exist_ok=True); (OUT/'media').mkdir(exist_ok=True); (OUT/'logs').mkdir(exist_ok=True)
+          S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36','Accept-Language':'ru-RU,ru;q=0.9,en;q=0.6'})
+
+          urls=[]
+          # Exact posts and several archive windows around 2026 and the 2025 season.
+          for mid in [133880,133900,133916,133917,133918,133919,133920,133921,134491,134492,134493,134494,134495,134496,134497,134498,134499,134500,115388]:
+              urls += [f'https://t.me/s/gribyspb/{mid}', f'https://t.me/gribyspb/{mid}?embed=1&mode=tme']
+          for before in list(range(115500,90000,-500))+[115388,115000,114500,114000,113500,113000,112500,112000,111500,111000,110500,110000,109500,109000,108500,108000,107500,107000,106500,106000,105500,105000,104500,104000,103500,103000,102500,102000,101500,101000,100500,100000]:
+              urls.append(f'https://t.me/s/gribyspb?before={before}')
+          # Search pages for all Vikulov posts and relevant exact terms.
+          qs=['%23%D0%92%D0%B8%D0%BA%D1%83%D0%BB%D0%BE%D0%B2','%D0%92%D0%B8%D0%BA%D1%83%D0%BB%D0%BE%D0%B2','%D0%B3%D0%BE%D1%81%D0%BD%D0%BE%D0%BC%D0%B5%D1%80','%D0%BD%D0%BE%D0%BC%D0%B5%D1%80%D0%BD%D0%BE%D0%B9+%D0%B7%D0%BD%D0%B0%D0%BA','%D0%BB%D1%83%D0%B6%D0%B0']
+          for q in qs:
+              urls.append('https://t.me/s/gribyspb?q='+q)
+              for before in [135000,130000,125000,120000,115500,115388,115000,112000,110000,108000,105000,102000,100000,95000,90000]:
+                  urls.append(f'https://t.me/s/gribyspb?before={before}&q={q}')
+
+          all_media=[]; all_posts=[]; seen_urls=set()
+          def clean_url(u):
+              u=html.unescape(u).replace('\\/','/').strip('"\' ') 
+              return u
+          for i,u in enumerate(dict.fromkeys(urls)):
+              try:
+                  r=S.get(u,timeout=45,allow_redirects=True)
+                  fn=OUT/'html'/f'{i:04d}_{hashlib.md5(u.encode()).hexdigest()[:8]}.html'
+                  fn.write_bytes(r.content)
+                  print(i,r.status_code,len(r.content),u)
+                  if not r.ok: continue
+                  soup=BeautifulSoup(r.text,'lxml')
+                  for msg in soup.select('.tgme_widget_message'):
+                      post=msg.get('data-post') or ''
+                      txt=' '.join(msg.get_text(' ',strip=True).split())
+                      dt=''
+                      t=msg.select_one('time'); dt=t.get('datetime','') if t else ''
+                      if post or txt:
+                          all_posts.append({'post':post,'datetime':dt,'text':txt,'source_url':u})
+                      for a in msg.select('[style], img[src], video[src], source[src], a[href]'):
+                          vals=[]
+                          if a.get('src'): vals.append(a.get('src'))
+                          if a.get('href'): vals.append(a.get('href'))
+                          st=a.get('style') or ''
+                          vals += re.findall(r"url\(['\"]?([^)'\"]+)",st)
+                          for x in vals:
+                              x=clean_url(x)
+                              if x.startswith('//'): x='https:'+x
+                              if x.startswith('http') and any(k in x for k in ['telesco.pe','telegram-cdn','userapi.com','vkuser','sun9-','cdn-vk','vk.com/video','vk.ru/video']):
+                                  all_media.append({'post':post,'url':x,'source_url':u})
+                  # Raw regex catches escaped JSON/media URLs.
+                  raw=html.unescape(r.text).replace('\\/','/')
+                  for x in re.findall(r'https?://[^\s"\'<>]+',raw):
+                      x=clean_url(x).rstrip('),;]')
+                      if any(k in x for k in ['telesco.pe','telegram-cdn','userapi.com','vkuser','sun9-','cdn-vk']):
+                          all_media.append({'post':'','url':x,'source_url':u})
+              except Exception as e:
+                  print('ERR',u,repr(e))
+
+          # Keep unique posts/media, and a compact Vikulov corpus.
+          uniq_posts={}
+          for p in all_posts:
+              key=(p['post'],p['text'])
+              uniq_posts[key]=p
+          posts=list(uniq_posts.values())
+          posts.sort(key=lambda x:(x['datetime'],x['post']))
+          (OUT/'posts.json').write_text(json.dumps(posts,ensure_ascii=False,indent=2),'utf-8')
+          vik=[p for p in posts if any(k.lower() in p['text'].lower() for k in ['викулов','госномер','номерной знак','луж','черник','приозерск'])]
+          (OUT/'relevant_posts.json').write_text(json.dumps(vik,ensure_ascii=False,indent=2),'utf-8')
+          (OUT/'relevant_posts.txt').write_text('\n\n'.join(f"{p['post']} {p['datetime']}\n{p['text']}\nSOURCE {p['source_url']}" for p in vik),'utf-8')
+
+          um=[]; seen=set()
+          for m in all_media:
+              u=m['url']
+              if u not in seen:
+                  seen.add(u); um.append(m)
+          (OUT/'media_urls.json').write_text(json.dumps(um,ensure_ascii=False,indent=2),'utf-8')
+
+          manifest=[]
+          for j,m in enumerate(um[:700]):
+              u=m['url']
+              # Skip page/video links; yt-dlp handles VK links below.
+              if 'vk.com/video' in u or 'vk.ru/video' in u: continue
+              try:
+                  rr=S.get(u,timeout=60,allow_redirects=True)
+                  ct=(rr.headers.get('content-type') or '').split(';')[0].lower()
+                  if rr.ok and (ct.startswith('image/') or ct.startswith('video/')) and 500 < len(rr.content) < 120_000_000:
+                      ext={'image/jpeg':'.jpg','image/png':'.png','image/webp':'.webp','image/gif':'.gif','video/mp4':'.mp4'}.get(ct,Path(urllib.parse.urlparse(rr.url).path).suffix or '.bin')
+                      h=hashlib.sha256(rr.content).hexdigest()
+                      fp=OUT/'media'/f'{j:04d}_{h[:12]}{ext}'
+                      if not fp.exists(): fp.write_bytes(rr.content)
+                      manifest.append({**m,'final':rr.url,'status':rr.status_code,'type':ct,'size':len(rr.content),'file':str(fp),'sha256':h})
+              except Exception as e: manifest.append({**m,'error':repr(e)})
+          (OUT/'media_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),'utf-8')
+
+          # Try all relevant VK posts/videos with yt-dlp. Errors are useful too.
+          targets=['https://vk.ru/wall-1391819_922278','https://vk.com/wall-1391819_922278',
+                   'https://vk.com/video-1391819_456249332','https://vk.com/video-1391819_456249334','https://vk.com/video-1391819_456249335']
+          # Discover every VK video URL from fetched pages.
+          for m in um:
+              if 'vk.com/video' in m['url'] or 'vk.ru/video' in m['url']: targets.append(m['url'])
+          for k,t in enumerate(dict.fromkeys(targets)):
+              log=OUT/'logs'/f'ytdlp_{k:03d}.log'
+              cmd=['yt-dlp','--no-warnings','--write-info-json','--write-thumbnail','--skip-download','-o',str(OUT/'media'/f'vk_{k:03d}_%(id)s.%(ext)s'),t]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=180)
+              log.write_text(p.stdout,'utf-8')
+
+          # File inventory and image dimensions.
+          from PIL import Image
+          inv=[]
+          for p in (OUT/'media').glob('*'):
+              d={'file':str(p),'size':p.stat().st_size}
+              try:
+                  im=Image.open(p); d.update({'width':im.width,'height':im.height,'format':im.format})
+              except Exception: pass
+              inv.append(d)
+          (OUT/'inventory.json').write_text(json.dumps(inv,ensure_ascii=False,indent=2),'utf-8')
+          print('POSTS',len(posts),'RELEVANT',len(vik),'MEDIA_URLS',len(um),'DOWNLOADED',len(inv))
+          PY
+          python /tmp/collect.py | tee out/run.log
+          find out -maxdepth 2 -type f -printf '%s %p\n' | sort -nr > out/files.txt
+
+      - name: Upload output
+        uses: actions/upload-artifact@v4
+        with:
+          name: geolocate-data
+          path: out
+          retention-days: 1
+          if-no-files-found: error

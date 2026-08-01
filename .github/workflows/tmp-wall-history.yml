@@ -1,0 +1,89 @@
+name: tmp-wall-history
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Crawl public personal wall post IDs around 2025
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/pages out/images
+          python -m pip install -q requests beautifulsoup4 lxml pillow
+          cat > /tmp/crawl.py <<'PY'
+          import requests,re,json,html,hashlib,concurrent.futures,time,urllib.parse
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          O=Path('out'); UA='Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+          ids=list(range(3450,4201))
+          def fetch(pid):
+            u=f'https://m.vk.com/wall247610259_{pid}'
+            try:
+              r=requests.get(u,headers={'User-Agent':UA,'Accept-Language':'ru-RU,ru;q=0.9'},timeout=30,allow_redirects=True)
+              txt=r.text
+              # A real post normally contains the canonical wall ID and article/structured data.
+              valid=(f'wall247610259_{pid}' in txt and len(txt)>3000 and not any(x in txt.lower() for x in ['page not found','страница не найдена']))
+              if not valid:return {'id':pid,'status':r.status_code,'size':len(txt),'valid':False}
+              soup=BeautifulSoup(txt,'lxml')
+              visible=' '.join(soup.get_text(' ',strip=True).split())
+              # Strip boilerplate around post as much as possible; keep full visible for search.
+              date=''; ld=[]
+              for sc in soup.find_all('script',{'type':'application/ld+json'}):
+                try: ld.append(json.loads(sc.string or sc.get_text()))
+                except: pass
+              links=[]
+              raw=html.unescape(txt).replace('\\/','/')
+              for x in re.findall(r'https?://[^\s"\'<>]+',raw):
+                x=x.rstrip('),;]')
+                if any(k in x for k in ['userapi.com','vkuserphoto.ru','sun9-','vk.com/video','vk.ru/video']): links.append(x)
+              rec={'id':pid,'status':r.status_code,'size':len(txt),'valid':True,'final':r.url,'visible':visible,'ld':ld,'media':list(dict.fromkeys(links))}
+              low=(visible+' '+txt).lower()
+              kws=['приозер','номер','луж','брод','черник','брусник','гриб','лесовоз','саморез','машин','ягод','раздоль','соснов','мельников','громов','мичурин','кузнеч','севастьян','плодовое','петровское','запорож','саперн','лосево','суходоль','румбол']
+              rec['hits']=[k for k in kws if k in low]
+              if rec['hits'] or pid in range(3600,4050):
+                (O/'pages'/f'{pid}.html').write_text(txt,'utf-8')
+              return rec
+            except Exception as e:return {'id':pid,'error':repr(e),'valid':False}
+          rec=[]
+          with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+            for i,r in enumerate(ex.map(fetch,ids)):
+              rec.append(r)
+              if i%100==0:print('DONE',i,r)
+          valid=[r for r in rec if r.get('valid')]
+          relevant=[r for r in valid if r.get('hits')]
+          (O/'all.json').write_text(json.dumps(rec,ensure_ascii=False,indent=2),'utf-8')
+          (O/'valid.json').write_text(json.dumps(valid,ensure_ascii=False,indent=2),'utf-8')
+          (O/'relevant.json').write_text(json.dumps(relevant,ensure_ascii=False,indent=2),'utf-8')
+          (O/'relevant.txt').write_text('\n\n'.join(f"POST {r['id']} HITS={r['hits']}\n{r['visible'][:20000]}\nMEDIA\n"+'\n'.join(r['media'][:100]) for r in relevant),'utf-8')
+          # Download unique images only for relevant posts.
+          seen={}; mani=[]; sess=requests.Session(); sess.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://vk.com/'})
+          for r in relevant:
+            for u in r.get('media',[]):
+              if '/video' in u:continue
+              try:
+                rr=sess.get(u,timeout=45,allow_redirects=True); ct=(rr.headers.get('content-type') or '').split(';')[0]
+                if rr.ok and ct.startswith('image/') and 1000<len(rr.content)<30_000_000:
+                  h=hashlib.sha256(rr.content).hexdigest()
+                  if h not in seen:
+                    ext={'image/jpeg':'.jpg','image/png':'.png','image/webp':'.webp'}.get(ct,'.bin'); fp=O/'images'/f'{r["id"]}_{len(seen):04d}_{h[:10]}{ext}'; fp.write_bytes(rr.content); seen[h]=str(fp)
+                  mani.append({'post_id':r['id'],'url':u,'file':seen[h],'sha':h,'size':len(rr.content)})
+              except:pass
+          (O/'manifest.json').write_text(json.dumps(mani,ensure_ascii=False,indent=2),'utf-8')
+          print('VALID',len(valid),'RELEVANT',len(relevant),'IMAGES',len(seen))
+          PY
+          python /tmp/crawl.py | tee out/run.log
+          find out -type f -printf '%s %p\n' | sort -nr > out/files.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wall-history
+          path: out
+          retention-days: 1
+          if-no-files-found: error

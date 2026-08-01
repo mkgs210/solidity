@@ -1,0 +1,52 @@
+name: tmp-geoclip
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  geoclip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Run weak visual geolocation model
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          python -m pip install -q geoclip requests pillow numpy torch torchvision
+          cat > /tmp/g.py <<'PY'
+          import requests,torch,numpy as np,json
+          from PIL import Image
+          from geoclip import GeoCLIP
+          urls={
+          'field':'https://sun9-25.vkuserphoto.ru/s/v1/ig2/tmuA-dodCNIoRM5d2-FkIptsLNueQS6D3zp2KZJx6xfxAuyWqJagbqujf3KMGxpMqmrMZUTeGcZ7Btea-IysRmMv.jpg?quality=95&as=32x24,48x36,72x54,108x81,160x120,240x180,360x270,480x360,540x405,640x480,720x540,1080x810,1280x960,1440x1080,2560x1920&from=bu',
+          'car':'https://sun9-78.vkuserphoto.ru/s/v1/ig2/cTFSrR6uPIPxWhKvRwY82nG3rwj6SlNrYKWYJXWlhLPHvoRABl01hunoYwXcUF4X_qdTVpibzpWPaP1JE9YYuh1U.jpg?quality=95&as=32x24,48x36,72x54,108x81,160x120,240x180,360x270,480x360,540x405,640x480,720x540,1080x810,1280x960,1440x1080,2560x1920&from=bu',
+          'forest':'https://sun9-42.vkuserphoto.ru/s/v1/ig2/_guQvMhsDE1p3mGOULQXjqRmAawT7-Zst-ufebn2UeuK_oYOWfIUsfUXG9vq6y-Fs1ZbFDZf6qPbG0L0l-QJAGHj.jpg?quality=95&as=32x24,48x36,72x54,108x81,160x120,240x180,360x270,480x360,540x405,640x480,720x540,1080x810,1280x960,1440x1080,2560x1920&from=bu'}
+          for n,u in urls.items():
+            r=requests.get(u,headers={'User-Agent':'Mozilla/5.0','Referer':'https://vk.com/'},timeout=90);open('/tmp/'+n+'.jpg','wb').write(r.content);print(n,r.status_code,len(r.content))
+          m=GeoCLIP();m.eval();out={}
+          for n in urls:
+            try:
+              gps,p=m.predict('/tmp/'+n+'.jpg',top_k=50);out[n]={'global':list(zip(gps.tolist(),p.tolist()))}
+            except Exception as e:out[n]={'global_error':repr(e)}
+          lats=np.arange(60.418,61.184,.005,dtype=np.float32);lons=np.arange(29.485,31.390,.01,dtype=np.float32);grid=np.array([(a,b) for a in lats for b in lons],np.float32);coords=torch.from_numpy(grid).to(m.device);ls=[]
+          for n in urls:
+            try:
+              im=Image.open('/tmp/'+n+'.jpg').convert('RGB');im=m.image_encoder.preprocess_image(im).to(m.device)
+              with torch.no_grad():x=m.forward(im,coords).detach().cpu()[0]
+              ls.append(x);v,i=torch.topk(x,100);out[n]['district']=[(grid[j].tolist(),float(z)) for z,j in zip(v.tolist(),i.tolist())]
+            except Exception as e:out[n]['district_error']=repr(e)
+          if ls:
+            X=torch.stack(ls)
+            for name,s in [('mean',X.mean(0)),('field_forest',(X[0]+X[2])/2),('min',X.min(0).values)]:
+              v,i=torch.topk(s,200);out[name]=[(grid[j].tolist(),float(z)) for z,j in zip(v.tolist(),i.tolist())]
+          open('out/results.json','w').write(json.dumps(out,indent=2))
+          PY
+          python /tmp/g.py | tee out/run.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: geoclip
+          path: out
+          retention-days: 1

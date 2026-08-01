@@ -1,0 +1,234 @@
+name: tmp-satellite-candidates-v2
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  candidates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Build satellite and OSM candidate atlas
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p out/data out/mosaics out/thumbs_osm out/thumbs_cv out/sheets_osm out/sheets_cv
+          python -m pip install -q requests shapely pyproj pillow numpy pandas scipy scikit-image
+          cat > /tmp/sat.py <<'PY'
+          import requests,json,math,time,io,hashlib,os
+          from pathlib import Path
+          import numpy as np,pandas as pd
+          from PIL import Image,ImageDraw
+          from shapely.geometry import Polygon,MultiPolygon,Point,LineString,shape,mapping
+          from shapely.ops import transform,unary_union
+          from pyproj import Transformer
+          from skimage.color import rgb2hsv
+          from skimage.filters import gaussian,threshold_otsu
+          from skimage.morphology import binary_opening,binary_closing,remove_small_objects,disk
+          from skimage.measure import label,regionprops
+          from scipy.ndimage import uniform_filter
+
+          O=Path('out'); S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0 geolocation-analysis/1.0'})
+          # Correct official district boundary.
+          u='https://nominatim.openstreetmap.org/lookup?osm_ids=R1117608&format=geojson&polygon_geojson=1'
+          r=S.get(u,timeout=120); print('BOUNDARY',r.status_code,len(r.content)); j=r.json(); boundary=shape(j['features'][0]['geometry'])
+          (O/'data'/'boundary.geojson').write_text(json.dumps({'type':'Feature','geometry':mapping(boundary),'properties':{}},ensure_ascii=False),'utf-8')
+          minx,miny,maxx,maxy=boundary.bounds; print('BBOX',boundary.bounds)
+          to_utm=Transformer.from_crs('EPSG:4326','EPSG:32636',always_xy=True).transform
+          to_ll=Transformer.from_crs('EPSG:32636','EPSG:4326',always_xy=True).transform
+          butm=transform(to_utm,boundary)
+
+          # Split Overpass requests into small bbox cells. Ways only are enough for a useful candidate atlas.
+          over=[]
+          endpoints=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.private.coffee/api/interpreter']
+          dx,dy=.28,.22
+          cells=[]; y=miny
+          while y<maxy:
+            x=minx
+            while x<maxx:
+              cells.append((y,x,min(y+dy,maxy),min(x+dx,maxx))); x+=dx
+            y+=dy
+          for ci,(s,w,n,e) in enumerate(cells):
+            q=f'''[out:json][timeout:120];(
+            way["landuse"~"^(meadow|farmland|grass|orchard|farmyard|recreation_ground)$"]({s},{w},{n},{e});
+            way["natural"~"^(grassland|heath|scrub)$"]({s},{w},{n},{e});
+            way["landcover"~"^(grass|meadow)$"]({s},{w},{n},{e});
+            way["highway"~"^(track|unclassified|service|path)$"]({s},{w},{n},{e});
+            node["place"~"^(city|town|village|hamlet|isolated_dwelling)$"]({s},{w},{n},{e});
+            );out body geom;'''
+            got=None
+            for ep in endpoints:
+              try:
+                rr=S.get(ep,params={'data':q},timeout=180)
+                print('OVER',ci,ep,rr.status_code,len(rr.content))
+                if rr.ok and len(rr.content)>100: got=rr.json();break
+              except Exception as ex: print('OERR',ci,ep,repr(ex))
+            if got: over.extend(got.get('elements',[]))
+            time.sleep(.15)
+          # deduplicate elements
+          dd={}
+          for e in over: dd[(e.get('type'),e.get('id'))]=e
+          over=list(dd.values()); (O/'data'/'overpass.json').write_text(json.dumps({'elements':over},ensure_ascii=False),'utf-8')
+          print('ELEMENTS',len(over))
+          fields=[];roads=[];sett=[]
+          for e in over:
+            tags=e.get('tags',{}); geom=e.get('geometry')
+            if e.get('type')=='node' and tags.get('place'):
+              p=Point(e['lon'],e['lat'])
+              if boundary.contains(p):sett.append({'id':e['id'],'name':tags.get('name',''),'place':tags.get('place'),'geom':p})
+              continue
+            if not geom or len(geom)<2:continue
+            cs=[(p['lon'],p['lat']) for p in geom]
+            if tags.get('highway'):
+              try: roads.append({'id':e['id'],'type':tags.get('highway'),'geom':LineString(cs)})
+              except:pass
+              continue
+            if tags.get('landuse') or tags.get('natural') or tags.get('landcover'):
+              try:
+                if cs[0]!=cs[-1]:cs.append(cs[0])
+                g=Polygon(cs)
+                if not g.is_valid:g=g.buffer(0)
+                g=g.intersection(boundary)
+                if not g.is_empty:fields.append({'id':e['id'],'tags':tags,'geom':g})
+              except:pass
+          print('PARSED',len(fields),len(roads),len(sett))
+          su=[(s,transform(to_utm,s['geom'])) for s in sett];ru=[(r,transform(to_utm,r['geom'])) for r in roads]
+          def axis(g):
+            cs=list(g.minimum_rotated_rectangle.exterior.coords)[:4];ss=[]
+            for i in range(4):
+              dx=cs[(i+1)%4][0]-cs[i][0];dy=cs[(i+1)%4][1]-cs[i][1];ss.append((math.hypot(dx,dy),dx,dy))
+            ss.sort(reverse=True);L,dx,dy=ss[0]; W=ss[-1][0];b=(math.degrees(math.atan2(dx,dy))+360)%180
+            return b,L,W
+          rows=[]
+          # merge neighboring open polygons (small mapped subdivisions of one meadow)
+          gs=[]
+          for f in fields:
+            g=transform(to_utm,f['geom'])
+            if not g.is_empty:gs.extend(list(g.geoms) if isinstance(g,MultiPolygon) else [g])
+          merged=unary_union([g.buffer(5) for g in gs]).buffer(-5) if gs else MultiPolygon([])
+          parts=list(merged.geoms) if isinstance(merged,MultiPolygon) else ([] if merged.is_empty else [merged])
+          for i,g in enumerate(parts):
+            area=g.area/10000
+            if not .5<=area<=150:continue
+            c=g.centroid;lon,lat=transform(to_ll,c).coords[0]
+            b,L,W=axis(g);err=min(abs(b-140),180-abs(b-140));ds=min([c.distance(x) for _,x in su],default=99999);dr=min([g.distance(x) for _,x in ru],default=99999)
+            near='';ptype=''
+            if su:
+              ss,sg=min(su,key=lambda x:c.distance(x[1]));near=ss['name'];ptype=ss['place']
+            nr=sum(1 for _,x in ru if g.buffer(120).intersects(x));asp=L/max(W,1);per=g.length;compact=4*math.pi*g.area/(per*per)
+            ap=math.exp(-((math.log(max(area,.01))-math.log(10))/1.35)**2/2);op=math.exp(-(err/38)**2/2);remote=min(ds/3500,1.5);rp=1 if dr<100 else math.exp(-(dr-100)/400)
+            score=2.0*ap+.8*op+.9*remote+.8*rp+.12*min(nr,5)+.15*min(asp,4)
+            rows.append({'source':'osm','id':i,'lon':lon,'lat':lat,'area_ha':area,'bearing':b,'axis_error':err,'length_m':L,'width_m':W,'aspect':asp,'compact':compact,'settlement_dist_m':ds,'nearest':near,'place_type':ptype,'road_dist_m':dr,'tracks':nr,'score':score,'geom':g})
+          rows.sort(key=lambda z:z['score'],reverse=True)
+          pd.DataFrame([{k:v for k,v in z.items() if k!='geom'} for z in rows]).to_csv(O/'data'/'osm_candidates.csv',index=False)
+          (O/'data'/'osm_candidates.geojson').write_text(json.dumps({'type':'FeatureCollection','features':[{'type':'Feature','geometry':mapping(transform(to_ll,z['geom'])),'properties':{k:v for k,v in z.items() if k!='geom'}} for z in rows]},ensure_ascii=False),'utf-8')
+
+          # Satellite helpers.
+          TILE='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';cache={}
+          def ll2px(lon,lat,z):
+            n=2**z;x=(lon+180)/360*n*256;lr=math.radians(max(min(lat,85.0511),-85.0511));y=(1-math.asinh(math.tan(lr))/math.pi)/2*n*256;return x,y
+          def px2ll(x,y,z):
+            n=2**z;lon=x/(n*256)*360-180;yy=math.pi*(1-2*y/(n*256));lat=math.degrees(math.atan(math.sinh(yy)));return lon,lat
+          def tile(x,y,z):
+            key=(x,y,z)
+            if key in cache:return cache[key]
+            for q in range(4):
+              try:
+                rr=S.get(TILE.format(z=z,y=y,x=x),timeout=60)
+                if rr.ok and len(rr.content)>1000:
+                  im=Image.open(io.BytesIO(rr.content)).convert('RGB');cache[key]=im;return im
+              except:pass
+              time.sleep(.7)
+            return Image.new('RGB',(256,256),(100,100,100))
+          def crop(lon,lat,z=15,size=1024):
+            cx,cy=ll2px(lon,lat,z);l=int(cx-size/2);t=int(cy-size/2);r=l+size;b=t+size;tx0=l//256;ty0=t//256;tx1=(r-1)//256;ty1=(b-1)//256;m=Image.new('RGB',((tx1-tx0+1)*256,(ty1-ty0+1)*256))
+            for yy in range(ty0,ty1+1):
+              for xx in range(tx0,tx1+1):m.paste(tile(xx,yy,z),((xx-tx0)*256,(yy-ty0)*256))
+            return m.crop((l-tx0*256,t-ty0*256,r-tx0*256,b-ty0*256)),l,t
+
+          # Complete district mosaic at z12 first, regardless of OSM availability.
+          z=12;x0,y1=ll2px(minx,miny,z);x1,y0=ll2px(maxx,maxy,z);left=int(min(x0,x1));right=int(max(x0,x1));top=int(min(y0,y1));bottom=int(max(y0,y1));tx0=left//256;tx1=right//256;ty0=top//256;ty1=bottom//256
+          mos=Image.new('RGB',((tx1-tx0+1)*256,(ty1-ty0+1)*256));print('MOSAIC',mos.size)
+          for yy in range(ty0,ty1+1):
+            for xx in range(tx0,tx1+1):mos.paste(tile(xx,yy,z),((xx-tx0)*256,(yy-ty0)*256))
+          mos.save(O/'mosaics'/'district_z12_clean.jpg',quality=94)
+          # Build boundary mask and coarse open-land segmentation.
+          arr=np.asarray(mos).astype(np.float32)/255;hsv=rgb2hsv(arr);V=hsv[:,:,2];Sat=hsv[:,:,1]
+          # local texture; fields tend to be brighter and smoother than forest, but retain brown fields/clearings too
+          mean=uniform_filter(V,size=9);mean2=uniform_filter(V*V,size=9);std=np.sqrt(np.maximum(mean2-mean*mean,0))
+          H,W=V.shape;mask_dist=np.zeros((H,W),bool)
+          bd=Image.new('1',(W,H));dr=ImageDraw.Draw(bd)
+          def lxy(lon,lat):x,y=ll2px(lon,lat,z);return (x-tx0*256,y-ty0*256)
+          bparts=list(boundary.geoms) if isinstance(boundary,MultiPolygon) else [boundary]
+          for p in bparts:dr.polygon([lxy(*c) for c in p.exterior.coords],fill=1)
+          mask_dist=np.array(bd,dtype=bool)
+          # multi-condition catches green meadows, dry grass, and pale clearings; reject blue/dark water
+          green=(arr[:,:,1]>arr[:,:,2]*.92)&(arr[:,:,1]>arr[:,:,0]*.88)
+          warm=(arr[:,:,0]>arr[:,:,2]*1.03)&(arr[:,:,1]>arr[:,:,2]*.98)
+          openmask=mask_dist&(V>.30)&(mean>.31)&(std<.17)&(Sat>.08)&(green|warm)
+          openmask=binary_opening(openmask,disk(1));openmask=binary_closing(openmask,disk(2));openmask=remove_small_objects(openmask,18)
+          lab=label(openmask);cvr=[]
+          # approximate m/px at each region center via WebMercator ground resolution
+          for reg in regionprops(lab,intensity_image=V):
+            if reg.area<18:continue
+            cy,cx=reg.centroid;gx=cx+tx0*256;gy=cy+ty0*256;lon,lat=px2ll(gx,gy,z);mpp=156543.03392*math.cos(math.radians(lat))/(2**z);area=reg.area*mpp*mpp/10000
+            if not .45<=area<=180:continue
+            minr,minc,maxr,maxc=reg.bbox;L=max(maxr-minr,maxc-minc)*mpp;WW=min(maxr-minr,maxc-minc)*mpp;asp=L/max(WW,1);comp=reg.solidity
+            p=Point(lon,lat)
+            if not boundary.contains(p):continue
+            pu=transform(to_utm,p);ds=min([pu.distance(x) for _,x in su],default=99999)
+            near=''
+            if su: ss,sg=min(su,key=lambda x:pu.distance(x[1]));near=ss['name']
+            # approximate road distance using center only
+            rd=min([pu.distance(x) for _,x in ru],default=99999)
+            # favors sizeable remote elongated-ish open patches, but keep broad coverage
+            ap=math.exp(-((math.log(max(area,.01))-math.log(9))/1.5)**2/2);score=1.7*ap+.9*min(ds/3500,1.5)+.4*min(asp,4)+.3*comp+.4*(1 if rd<250 else math.exp(-(rd-250)/800))
+            cvr.append({'source':'cv','id':int(reg.label),'lon':lon,'lat':lat,'area_ha':area,'bbox_w_m':(maxc-minc)*mpp,'bbox_h_m':(maxr-minr)*mpp,'aspect':asp,'solidity':comp,'mean_v':reg.mean_intensity,'settlement_dist_m':ds,'nearest':near,'road_center_dist_m':rd,'score':score,'bbox':[int(minr),int(minc),int(maxr),int(maxc)]})
+          cvr.sort(key=lambda q:q['score'],reverse=True);pd.DataFrame(cvr).to_csv(O/'data'/'cv_candidates.csv',index=False)
+          print('CANDIDATES',len(rows),len(cvr))
+          # diagnostic segmentation overlay
+          ov=mos.copy();d=ImageDraw.Draw(ov,'RGBA')
+          for rank,q in enumerate(cvr[:500],1):
+            minr,minc,maxr,maxc=q['bbox'];d.rectangle((minc,minr,maxc,maxr),outline=(255,255,0,180),width=2)
+            if rank<=150:d.text((minc,minr),str(rank),fill=(255,255,0,255))
+          for rank,q in enumerate(rows[:180],1):
+            x,y=lxy(q['lon'],q['lat']);d.ellipse((x-4,y-4,x+4,y+4),fill=(255,0,0,220));d.text((x+4,y),str(rank),fill=(255,0,0,255))
+          for p in bparts:d.line([lxy(*c) for c in p.exterior.coords],fill=(255,0,255,230),width=4)
+          ov.save(O/'mosaics'/'district_z12_overlay.jpg',quality=94)
+
+          def make_atlas(items,kind,outthumb,outsheet,nmax=240):
+            cards=[]
+            for rank,q in enumerate(items[:nmax],1):
+              im,l,t=crop(q['lon'],q['lat'],15,1024);dd=ImageDraw.Draw(im,'RGBA');cx,cy=ll2px(q['lon'],q['lat'],15);cx-=l;cy-=t;dd.ellipse((cx-12,cy-12,cx+12,cy+12),fill=(255,255,0,230));ang=math.radians(320);dd.line((cx,cy,cx+130*math.sin(ang),cy-130*math.cos(ang)),fill=(255,255,0,230),width=7)
+              if kind=='osm' and 'geom' in q:
+                gg=transform(to_ll,q['geom']);pps=list(gg.geoms) if isinstance(gg,MultiPolygon) else [gg]
+                for p in pps:
+                  pts=[]
+                  for lo,la in p.exterior.coords:x,y=ll2px(lo,la,15);pts.append((x-l,y-t))
+                  dd.line(pts,fill=(255,0,0,230),width=6)
+              im=im.resize((430,430),Image.Resampling.LANCZOS);card=Image.new('RGB',(450,505),'white');card.paste(im,(10,10));d2=ImageDraw.Draw(card)
+              if kind=='osm':labtxt=f"#{rank} {q['lat']:.5f},{q['lon']:.5f}\n{q['area_ha']:.1f}ha axis {q['bearing']:.0f} asp {q['aspect']:.1f}\nsett {q['settlement_dist_m']/1000:.1f}km {q['nearest']} road {q['road_dist_m']:.0f}m"
+              else:labtxt=f"#{rank} {q['lat']:.5f},{q['lon']:.5f}\n{q['area_ha']:.1f}ha asp {q['aspect']:.1f} sol {q['solidity']:.2f}\nsett {q['settlement_dist_m']/1000:.1f}km {q['nearest']} road {q['road_center_dist_m']:.0f}m"
+              d2.multiline_text((10,445),labtxt,fill='black',spacing=2);card.save(outthumb/f'{rank:03d}_{q["lat"]:.5f}_{q["lon"]:.5f}.jpg',quality=90);cards.append(card)
+              if rank%20==0:print(kind,'THUMB',rank)
+            for si in range((len(cards)+19)//20):
+              sh=Image.new('RGB',(1800,2525),'white')
+              for j,c in enumerate(cards[si*20:(si+1)*20]):sh.paste(c,((j%4)*450,(j//4)*505))
+              sh.save(outsheet/f'{kind}_{si+1:02d}.jpg',quality=93)
+          make_atlas(rows,'osm',O/'thumbs_osm',O/'sheets_osm',220)
+          make_atlas(cvr,'cv',O/'thumbs_cv',O/'sheets_cv',260)
+          print('DONE')
+          PY
+          python /tmp/sat.py | tee out/run.log
+          find out -type f -printf '%s %p\n' | sort -nr > out/files.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: satellite-candidates-v2
+          path: out
+          retention-days: 1
+          if-no-files-found: warn
